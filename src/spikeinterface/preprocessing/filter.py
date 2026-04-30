@@ -96,11 +96,15 @@ class FilterRecording(BasePreprocessor):
         dtype=None,
         direction="forward-backward",
         n_workers=1,
+        method="iir",
     ):
         import scipy.signal
 
         assert filter_mode in ("sos", "ba"), "'filter' mode must be 'sos' or 'ba'"
         assert int(n_workers) >= 1, "n_workers must be >= 1"
+        assert method in ("iir", "fir_magnitude_matched"), (
+            "'method' must be 'iir' (default) or 'fir_magnitude_matched'"
+        )
         fs = recording.get_sampling_frequency()
         if coeff is None:
             assert btype in ("bandpass", "highpass"), "'bytpe' must be 'bandpass' or 'highpass'"
@@ -127,6 +131,43 @@ class FilterRecording(BasePreprocessor):
         assert margin_ms is not None, "margin_ms must be provided!"
         margin = int(margin_ms * fs / 1000.0)
 
+        # If method='fir_magnitude_matched', design the FIR once at construction
+        # time and pass it to each segment.  The FIR is intended to substitute
+        # for the IIR's filtfilt response (single-pass FIR ≈ filtfilt IIR in
+        # magnitude), so we require direction='forward-backward'.  For
+        # unsupported specs (filter_mode='ba', non-Butterworth IIRs that don't
+        # design cleanly as FIR, bandstop) we fall back to IIR with a warning.
+        fir_kernel = None
+        fir_block_size = None
+        effective_method = method
+        if method == "fir_magnitude_matched":
+            if filter_mode != "sos":
+                warnings.warn(
+                    "method='fir_magnitude_matched' requires filter_mode='sos'; "
+                    "falling back to IIR.",
+                    stacklevel=2,
+                )
+                effective_method = "iir"
+            elif direction != "forward-backward":
+                warnings.warn(
+                    "method='fir_magnitude_matched' requires "
+                    "direction='forward-backward'; falling back to IIR.",
+                    stacklevel=2,
+                )
+                effective_method = "iir"
+            else:
+                from ._fir_filter import design_matched_fir_from_sos
+                try:
+                    fir_kernel = design_matched_fir_from_sos(
+                        np.asarray(filter_coeff), fs
+                    )
+                except (ValueError, RuntimeError) as exc:
+                    warnings.warn(
+                        f"FIR design failed ({exc}); falling back to IIR.",
+                        stacklevel=2,
+                    )
+                    effective_method = "iir"
+
         global_job_kwargs_chunk_size = ensure_chunk_size(recording, **get_global_job_kwargs())
         if is_set_global_job_kwargs_set() and margin > MARGIN_TO_CHUNK_PERCENT_WARNING * global_job_kwargs_chunk_size:
             warnings.warn(
@@ -146,6 +187,9 @@ class FilterRecording(BasePreprocessor):
                     add_reflect_padding=add_reflect_padding,
                     direction=direction,
                     n_workers=int(n_workers),
+                    method=effective_method,
+                    fir_kernel=fir_kernel,
+                    fir_block_size=fir_block_size,
                 )
             )
 
@@ -162,6 +206,7 @@ class FilterRecording(BasePreprocessor):
             dtype=dtype.str,
             direction=direction,
             n_workers=int(n_workers),
+            method=method,
         )
 
 
@@ -176,6 +221,9 @@ class FilterRecordingSegment(BasePreprocessorSegment):
         add_reflect_padding=False,
         direction="forward-backward",
         n_workers=1,
+        method="iir",
+        fir_kernel=None,
+        fir_block_size=None,
     ):
         BasePreprocessorSegment.__init__(self, parent_recording_segment)
         self.coeff = coeff
@@ -185,6 +233,12 @@ class FilterRecordingSegment(BasePreprocessorSegment):
         self.add_reflect_padding = add_reflect_padding
         self.dtype = dtype
         self.n_workers = int(n_workers)
+        self.method = method
+        # Cached FIR convolvers, keyed by chunk-T (reused across calls).
+        self._fir_kernel = fir_kernel
+        self._fir_block_size = fir_block_size
+        self._fir_convolvers: dict = {}
+        self._fir_convolvers_lock = threading.Lock()
         # Per-caller-thread lazy pool map.  Each outer thread that calls
         # get_traces() on this segment gets its own inner pool, avoiding the
         # shared-pool queueing pathology that would occur if multiple outer
@@ -271,6 +325,55 @@ class FilterRecordingSegment(BasePreprocessorSegment):
             fut.result()
         return out
 
+    def _get_fir_convolver(self, T):
+        """Lazy-build (and cache) a CachedOSConvolver for chunk length T."""
+        conv = self._fir_convolvers.get(T)
+        if conv is not None:
+            return conv
+        with self._fir_convolvers_lock:
+            conv = self._fir_convolvers.get(T)
+            if conv is None:
+                from ._fir_filter import CachedOSConvolver
+
+                conv = CachedOSConvolver(
+                    self._fir_kernel, T, block_size=self._fir_block_size
+                )
+                self._fir_convolvers[T] = conv
+            return conv
+
+    def _apply_fir(self, traces, axis=0):
+        """Apply the cached overlap-save FIR to a (T, C) chunk.
+
+        Channel-block parallelism follows the same per-caller-thread pool
+        pattern as ``_apply_sos``, but channels are sized for L2 fit (the
+        FIR's per-block working set is ~2 * block_size * chunk_C * 4 bytes,
+        vs IIR which is purely streaming and L2-insensitive).
+        """
+        from ._fir_filter import pick_chunk_C
+
+        assert axis == 0, "FIR path only supports axis=0"
+        T = traces.shape[0]
+        C = traces.shape[1] if traces.ndim == 2 else 1
+        conv = self._get_fir_convolver(T)
+
+        if self.n_workers <= 1 or C < 2 * self.n_workers or traces.ndim == 1:
+            out = np.empty(traces.shape, dtype=traces.dtype)
+            conv(traces, out=out)
+            return out
+
+        chunk_C = pick_chunk_C(C, conv.block_size, self.n_workers)
+        bounds = [(c0, min(c0 + chunk_C, C)) for c0 in range(0, C, chunk_C)]
+        out = np.empty(traces.shape, dtype=traces.dtype)
+        pool = self._get_pool()
+
+        def _work(c0, c1):
+            conv(traces[:, c0:c1], out=out[:, c0:c1])
+
+        futures = [pool.submit(_work, c0, c1) for c0, c1 in bounds]
+        for fut in futures:
+            fut.result()
+        return out
+
     def get_traces(self, start_frame, end_frame, channel_indices):
         traces_chunk, left_margin, right_margin = get_chunk_with_margin(
             self.parent_recording_segment,
@@ -288,7 +391,15 @@ class FilterRecordingSegment(BasePreprocessorSegment):
 
         import scipy.signal
 
-        if self.direction == "forward-backward":
+        if self.method == "fir_magnitude_matched":
+            # Linear-phase FIR matched to IIR's filtfilt magnitude.  No
+            # forward/backward distinction (single-pass, zero-phase via
+            # centered slice on the linear-phase response).  FIR design
+            # was promoted to fp32 in __init__; promote int input here too.
+            if not np.issubdtype(traces_chunk.dtype, np.floating):
+                traces_chunk = traces_chunk.astype("float32")
+            filtered_traces = self._apply_fir(traces_chunk, axis=0)
+        elif self.direction == "forward-backward":
             if self.filter_mode == "sos":
                 filtered_traces = self._apply_sos(scipy.signal.sosfiltfilt, traces_chunk, axis=0)
             elif self.filter_mode == "ba":
