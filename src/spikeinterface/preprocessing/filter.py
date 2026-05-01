@@ -75,6 +75,32 @@ class FilterRecording(BasePreprocessor):
         - "forward" - filter is applied to the timeseries in one direction, creating phase shifts
         - "backward" - the timeseries is reversed, the filter is applied and filtered timeseries reversed again. Creates phase shifts in the opposite direction to "forward"
         - "forward-backward" - Applies the filter in the forward and backward direction, resulting in zero-phase filtering. Note this doubles the effective filter order.
+    n_workers : int, default: 1
+        Channel-parallel pool size for the SOS path. See ``_apply_sos`` for details.
+    method : "iir" | "fir_magnitude_matched", default: "iir"
+        Filtering method.
+
+        - "iir" preserves the historical behavior — applies ``scipy.signal.sosfiltfilt``
+          (or ``filtfilt``/``lfilter`` per ``direction``) to the IIR coefficients above.
+        - "fir_magnitude_matched" designs a linear-phase Remez FIR matching the IIR's
+          ``sosfiltfilt`` magnitude response (within ``stopband_db`` tolerance) and
+          applies it via cached overlap-save with the same ``n_workers`` channel pool.
+          The FIR output is *not* sample-equivalent to the IIR — only the magnitude
+          spec matches — but it is much cheaper for long signals and has constant
+          group delay (no waveform-shape distortion across frequency).
+    stopband_db : float, default: 60.0
+        Target stopband attenuation in dB for the FIR design when
+        ``method="fir_magnitude_matched"``. Lower values produce somewhat shorter
+        FIRs at the cost of less aggressive out-of-band suppression. The savings are
+        modest because lowering the stopband target also narrows the IIR's
+        transition band (the IIR's −X dB point sits closer to its −3 dB cutoff than
+        its −60 dB point), and the two effects mostly cancel: e.g., HP order-5 at
+        300 Hz, fs=30 kHz: 60 dB → 399 taps; 30 dB → 355 taps (~11% savings).
+        For typical Neuropixels recordings where the analog hardware has already
+        AC-coupled most LFP, 30 dB is empirically sufficient to put residual
+        out-of-band content well below the per-channel noise floor; the default of
+        60 dB is conservative and adds margin against unmeasured worst-case
+        recordings. Ignored when ``method="iir"``.
 
     Returns
     -------
@@ -97,6 +123,7 @@ class FilterRecording(BasePreprocessor):
         direction="forward-backward",
         n_workers=1,
         method="iir",
+        stopband_db=60.0,
     ):
         import scipy.signal
 
@@ -105,6 +132,7 @@ class FilterRecording(BasePreprocessor):
         assert method in ("iir", "fir_magnitude_matched"), (
             "'method' must be 'iir' (default) or 'fir_magnitude_matched'"
         )
+        assert stopband_db > 0, "stopband_db must be positive"
         fs = recording.get_sampling_frequency()
         if coeff is None:
             assert btype in ("bandpass", "highpass"), "'bytpe' must be 'bandpass' or 'highpass'"
@@ -159,7 +187,7 @@ class FilterRecording(BasePreprocessor):
                 from ._fir_filter import design_matched_fir_from_sos
                 try:
                     fir_kernel = design_matched_fir_from_sos(
-                        np.asarray(filter_coeff), fs
+                        np.asarray(filter_coeff), fs, stopband_db=float(stopband_db)
                     )
                 except (ValueError, RuntimeError) as exc:
                     warnings.warn(
@@ -207,6 +235,7 @@ class FilterRecording(BasePreprocessor):
             direction=direction,
             n_workers=int(n_workers),
             method=method,
+            stopband_db=float(stopband_db),
         )
 
 

@@ -302,3 +302,88 @@ class TestFallback:
             rec_fir.get_traces(start_frame=2_000, end_frame=T - 2_000),
             rec_iir.get_traces(start_frame=2_000, end_frame=T - 2_000),
         )
+
+
+# ---- stopband_db kwarg ------------------------------------------------------
+
+
+class TestStopbandDB:
+    def _segment_kernel(self, rec):
+        """Pull the FIR kernel that was designed for the segment."""
+        from spikeinterface.preprocessing._fir_filter import CachedOSConvolver  # noqa: F401
+        return rec._segments[0]._fir_kernel
+
+    def test_stopband_default_is_60(self):
+        rec, _, _ = self._make_rec()
+        fir = HighpassFilterRecording(
+            rec, freq_min=300.0, dtype="float32", method="fir_magnitude_matched"
+        )
+        # Default stopband=60 dB used; tap count for HP order 5 at 300 Hz
+        # is 399 (well-tested in existing tests).
+        assert len(self._segment_kernel(fir)) == 399
+
+    def test_stopband_lower_means_fewer_taps(self):
+        rec, _, _ = self._make_rec()
+        fir60 = HighpassFilterRecording(
+            rec, freq_min=300.0, dtype="float32",
+            method="fir_magnitude_matched", stopband_db=60.0,
+        )
+        fir40 = HighpassFilterRecording(
+            rec, freq_min=300.0, dtype="float32",
+            method="fir_magnitude_matched", stopband_db=40.0,
+        )
+        fir30 = HighpassFilterRecording(
+            rec, freq_min=300.0, dtype="float32",
+            method="fir_magnitude_matched", stopband_db=30.0,
+        )
+        n60 = len(self._segment_kernel(fir60))
+        n40 = len(self._segment_kernel(fir40))
+        n30 = len(self._segment_kernel(fir30))
+        # Lowering stopband_db saves taps, but less than naive Bellanger
+        # would predict because the IIR's transition narrows at lower-dB
+        # points (the -3 dB to -X dB transition shrinks as X drops),
+        # which partly offsets the Bellanger reduction.  Empirically ~11%
+        # tap savings going 60 → 30 dB on this filter.
+        assert n30 < n40 < n60
+        assert n60 == 399
+        assert 350 <= n40 <= 390
+        assert 340 <= n30 <= 380
+
+    def test_kwargs_round_trip_includes_stopband(self):
+        rec, _, _ = self._make_rec()
+        fir = HighpassFilterRecording(
+            rec, freq_min=300.0, dtype="float32",
+            method="fir_magnitude_matched", stopband_db=42.0,
+        )
+        # FilterRecording's _kwargs always includes stopband_db (parent class).
+        # The wrapper overrides _kwargs but **filter_kwargs propagates the kwarg.
+        assert fir._kwargs.get("stopband_db") == 42.0
+
+    def test_stopband_attenuation_meets_target(self):
+        """The designed FIR achieves the requested stopband attenuation in
+        the IIR's deep stopband."""
+        import scipy.signal
+        rec, _, _ = self._make_rec()
+        for target in (30.0, 40.0, 50.0):
+            fir = HighpassFilterRecording(
+                rec, freq_min=300.0, dtype="float32",
+                method="fir_magnitude_matched", stopband_db=target,
+            )
+            h = self._segment_kernel(fir)
+            sos = scipy.signal.butter(5, 300.0, btype="highpass", fs=FS, output="sos")
+            w_iir, h_iir = scipy.signal.sosfreqz(sos, worN=8192, fs=FS)
+            iir_db = 20 * np.log10(np.maximum(np.abs(h_iir) ** 2, 1e-30))
+            w_fir, h_fir = scipy.signal.freqz(h, worN=8192, fs=FS)
+            fir_db = 20 * np.log10(np.maximum(np.abs(h_fir), 1e-30))
+            stop_mask = iir_db <= -60.0  # IIR's deep stopband
+            if not np.any(stop_mask):
+                continue
+            worst_fir = float(np.max(fir_db[stop_mask]))
+            assert worst_fir < -target + 5.0, (
+                f"target={target}, worst FIR in IIR -60dB region = {worst_fir:.1f} dB"
+            )
+
+    def _make_rec(self, T=60_000, C=8, seed=0):
+        rng = np.random.default_rng(seed)
+        traces = (rng.standard_normal((T, C)) * 30.0).astype(np.float32)
+        return NumpyRecording([traces], sampling_frequency=FS), T, C
