@@ -41,12 +41,19 @@ worker threads.
 
 from __future__ import annotations
 
+import importlib.util
 import math
+import os
 from typing import Any
 
 import numpy as np
 import scipy.fft as sp_fft
 import scipy.signal
+
+
+HAVE_NUMBA = importlib.util.find_spec("numba") is not None
+# Allow forcing the pure-python OS inner loop for benchmarking / debugging.
+USE_NUMBA = HAVE_NUMBA and os.environ.get("SI_FIR_NO_NUMBA") != "1"
 
 
 # ---- Stop-band / pass-band design targets ---------------------------------
@@ -250,6 +257,74 @@ def _calc_oa_block_size(s1: int, s2: int) -> int:
     return block_size
 
 
+# ---- Optional numba-jitted inner-loop helpers -----------------------------
+#
+# At n_workers > 1 the OS inner-loop body becomes GIL-bound: each block does
+# ~10 short Python statements (slice arithmetic, zero-pad, slice assignment,
+# in-place complex multiply) that hold the GIL.  Across N workers those
+# statements serialize to N× their per-worker cost.  Routing the same
+# operations through ``@njit(nogil=True)`` helpers releases the GIL during
+# the slicing and the broadcast multiply, which closes most of the
+# parallel-scaling gap at n_workers ≥ 4.  Single-thread is essentially
+# unchanged (Python overhead is ~1-2% there).
+#
+# scipy.fft cannot be called from inside ``@njit`` so the FFT/IFFT calls
+# remain at Python level — we only JIT the surrounding work.
+#
+# Falls back to the pure-Python loop if numba is unavailable or
+# ``SI_FIR_NO_NUMBA=1``.
+
+if USE_NUMBA:
+    import numba
+
+    # Only the slice/index-heavy parts of the inner loop are JIT'd.  The
+    # complex-multiply (``sp1 *= kfft[:, None]``) is a numpy ufunc that
+    # already releases the GIL for non-tiny arrays, and a hand-rolled
+    # numba loop diverges by 1 ULP from numpy's broadcast multiply
+    # without measurable speedup, so we leave it as numpy.
+
+    @numba.njit(cache=True, nogil=True, fastmath=False)
+    def _stage_block_2d_nb(
+        x: np.ndarray,
+        tdbuf: np.ndarray,
+        in_start: int,
+        T: int,
+    ) -> None:
+        bs = tdbuf.shape[0]
+        src_lo = 0 if in_start < 0 else in_start
+        in_stop = in_start + bs
+        src_hi = T if in_stop > T else in_stop
+        tdbuf_lo = src_lo - in_start
+        tdbuf_hi = tdbuf_lo + (src_hi - src_lo)
+        if tdbuf_lo > 0:
+            tdbuf[:tdbuf_lo] = 0
+        if tdbuf_hi < bs:
+            tdbuf[tdbuf_hi:] = 0
+        tdbuf[tdbuf_lo:tdbuf_hi] = x[src_lo:src_hi]
+
+    @numba.njit(cache=True, nogil=True, fastmath=False)
+    def _write_block_2d_nb(
+        out: np.ndarray,
+        ret_block: np.ndarray,
+        save_start_full: int,
+        gd: int,
+        sb: int,
+        sv: int,
+        T: int,
+    ) -> None:
+        out_lo = save_start_full - gd
+        out_hi = save_start_full + sb - gd
+        neg_lo = -out_lo
+        valid_lo = 0 if neg_lo < 0 else neg_lo
+        excess_hi = out_hi - T
+        valid_hi = sb if excess_hi < 0 else sb - excess_hi
+        if valid_hi <= valid_lo:
+            return
+        dst_lo = 0 if out_lo < 0 else out_lo
+        dst_hi = T if out_hi > T else out_hi
+        out[dst_lo:dst_hi] = ret_block[sv + valid_lo : sv + valid_hi]
+
+
 # ---- Cached overlap-save convolver ----------------------------------------
 
 
@@ -338,6 +413,23 @@ class CachedOSConvolver:
             tdbuf = np.empty((bs, x.shape[1]), dtype=x.dtype)
         else:
             tdbuf = np.empty(bs, dtype=x.dtype)
+
+        # Numba path: GIL released during the slice work via @njit(nogil=True)
+        # helpers so the channel-block thread pool actually scales.  The
+        # FFT and ufunc multiply remain at Python level (scipy.fft is not
+        # @njit-callable; numpy's broadcast multiply is already GIL-releasing
+        # and bit-identical to the existing path).
+        if USE_NUMBA and is_2d and x.dtype == np.float32:
+            kfft_view = kfft[:, None]
+            for b in range(self.nblocks):
+                save_start_full = b * sb
+                in_start = save_start_full - sv
+                _stage_block_2d_nb(x, tdbuf, in_start, T)
+                sp1 = sp_fft.rfft(tdbuf, axis=0)
+                sp1 *= kfft_view
+                ret_block = sp_fft.irfft(sp1, n=bs, axis=0, overwrite_x=True)
+                _write_block_2d_nb(out, ret_block, save_start_full, gd, sb, sv, T)
+            return out
 
         for b in range(self.nblocks):
             save_start_full = b * sb
