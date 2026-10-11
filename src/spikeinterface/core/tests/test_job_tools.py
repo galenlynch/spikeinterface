@@ -373,17 +373,21 @@ def _record_thread_budget(segment_index, start_frame, end_frame, worker_ctx):
     return get_thread_budget()
 
 
-@pytest.mark.parametrize("n_jobs", [1, 2])
-def test_executor_sets_thread_budget(n_jobs):
+def _empty_worker_dict():
+    return {}
+
+
+@pytest.mark.parametrize("n_jobs, pool_engine", [(1, "thread"), (2, "thread"), (2, "process")])
+def test_executor_sets_thread_budget(n_jobs, pool_engine):
     recording = generate_recording(num_channels=2, durations=[1.0])
     executor = TimeSeriesChunkExecutor(
         recording,
         _record_thread_budget,
-        lambda: {},
+        _empty_worker_dict,
         (),
         handle_returns=True,
         n_jobs=n_jobs,
-        pool_engine="thread",
+        pool_engine=pool_engine,
         chunk_duration="0.25s",
         max_threads_per_worker=3,
     )
