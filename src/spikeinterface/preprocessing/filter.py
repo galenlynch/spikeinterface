@@ -9,6 +9,7 @@ from spikeinterface.core import (
     get_global_job_kwargs,
     is_set_global_job_kwargs_set,
 )
+from spikeinterface.core.job_tools import _get_inner_pool
 
 from .basepreprocessor import BasePreprocessor, BasePreprocessorSegment
 
@@ -221,13 +222,14 @@ class FilterRecordingSegment(BasePreprocessorSegment):
 
         from scipy.signal import sosfiltfilt, filtfilt, sosfilt, lfilter
 
-        # Channels are filtered independently, so filtering in blocks gives the same result with a
-        # much lower peak memory (scipy makes several float copies of its input)
+        # Channels are filtered independently, so filtering in banks gives the same result with a
+        # much lower peak memory (scipy makes several float copies of its input); banks also run in
+        # parallel when the thread budget allows, since scipy's filters release the GIL
         num_samples = traces_chunk.shape[0] - left_margin - right_margin
         num_channels = traces_chunk.shape[1]
         filtered_traces = np.empty((num_samples, num_channels), dtype=self.dtype)
 
-        for channel_index in range(0, num_channels, NUM_CHANNELS_PER_BLOCK):
+        def filter_bank(channel_index):
             channel_slice = slice(channel_index, channel_index + NUM_CHANNELS_PER_BLOCK)
             block = traces_chunk[:, channel_slice]
 
@@ -256,6 +258,14 @@ class FilterRecordingSegment(BasePreprocessorSegment):
                 filtered_block = filtered_block.round()
 
             filtered_traces[:, channel_slice] = filtered_block
+
+        bank_starts = range(0, num_channels, NUM_CHANNELS_PER_BLOCK)
+        pool = _get_inner_pool()
+        if pool is None or len(bank_starts) < 2:
+            for channel_index in bank_starts:
+                filter_bank(channel_index)
+        else:
+            list(pool.map(filter_bank, bank_starts))
 
         return filtered_traces
 
