@@ -4,7 +4,8 @@ import numpy as np
 from spikeinterface.core import generate_recording
 from spikeinterface import NumpyRecording, set_global_tmp_folder
 
-from spikeinterface.preprocessing import filter, bandpass_filter, notch_filter, causal_filter
+from spikeinterface.core import thread_budget
+from spikeinterface.preprocessing import filter, bandpass_filter, notch_filter, causal_filter, scale
 
 
 class TestCausalFilter:
@@ -233,3 +234,41 @@ if __name__ == "__main__":
     tmp_path = Path(tempfile.mkdtemp())
 
     test_filter(tmp_path)
+
+
+def test_filter_banks_match_whole_chunk_filtering():
+    import scipy.signal
+
+    traces = (np.random.default_rng(0).standard_normal((30_000, 70)) * 50).astype("float32")
+    rec = bandpass_filter(NumpyRecording(traces, 30_000.0))
+    expected = scipy.signal.sosfiltfilt(rec._recording_segments[0].coeff, traces, axis=0)
+    serial = rec.get_traces()
+    np.testing.assert_array_equal(serial, expected.astype("float32"))
+    with thread_budget(4):
+        np.testing.assert_array_equal(rec.get_traces(), serial)
+
+
+def test_filter_threads_through_a_step_that_ignores_the_budget(monkeypatch):
+    # A step between the caller and the filter must not stop the filter from using its threads
+    import threading
+    import time
+    import scipy.signal
+
+    thread_ids = set()
+    sosfiltfilt = scipy.signal.sosfiltfilt
+
+    def recording_sosfiltfilt(*args, **kwargs):
+        thread_ids.add(threading.get_ident())
+        time.sleep(0.01)
+        return sosfiltfilt(*args, **kwargs)
+
+    monkeypatch.setattr(scipy.signal, "sosfiltfilt", recording_sosfiltfilt)
+    traces = np.random.default_rng(0).standard_normal((3_000, 64)).astype("float32")
+    chain = scale(bandpass_filter(NumpyRecording(traces, 30_000.0)), gain=2.0)
+    serial = chain.get_traces()
+    assert len(thread_ids) == 1
+    thread_ids.clear()
+    with thread_budget(4):
+        threaded = chain.get_traces()
+    assert len(thread_ids) > 1
+    np.testing.assert_array_equal(threaded, serial)
