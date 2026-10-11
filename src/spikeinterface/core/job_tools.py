@@ -744,7 +744,10 @@ _thread_budget = ContextVar("thread_budget", default=1)
 
 @contextmanager
 def thread_budget(max_threads):
-    """Let each step of a get_traces call made in this context use up to `max_threads` threads (None means 1)."""
+    """Let each step of a get_traces call made in this context use up to `max_threads` threads (None means 1).
+
+    TimeSeriesChunkExecutor sets the budget from `max_threads_per_worker` inside each task, overriding this.
+    """
     token = _thread_budget.set(max(1, int(max_threads or 1)))
     try:
         yield
