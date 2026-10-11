@@ -99,6 +99,9 @@ from .job_tools import (
     TimeSeriesChunkExecutor,
     split_job_kwargs,
     fix_job_kwargs,
+    thread_budget,
+    get_thread_budget,
+    get_inner_pool,
 )
 from .recording_tools import (
     write_binary_recording,

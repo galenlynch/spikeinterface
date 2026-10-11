@@ -8,7 +8,10 @@ import platform
 import sys
 import threading
 import warnings
+import weakref
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import numpy as np
 from threadpoolctl import threadpool_limits
@@ -537,12 +540,13 @@ class TimeSeriesChunkExecutor:
             if self.need_worker_index:
                 worker_dict["worker_index"] = worker_index
 
-            for segment_index, frame_start, frame_stop in slices:
-                res = self.func(segment_index, frame_start, frame_stop, worker_dict)
-                if self.handle_returns:
-                    returns.append(res)
-                if self.gather_func is not None:
-                    self.gather_func(res)
+            with thread_budget(self.max_threads_per_worker):
+                for segment_index, frame_start, frame_stop in slices:
+                    res = self.func(segment_index, frame_start, frame_stop, worker_dict)
+                    if self.handle_returns:
+                        returns.append(res)
+                    if self.gather_func is not None:
+                        self.gather_func(res)
 
         else:
             n_jobs = min(self.n_jobs, len(slices))
@@ -652,11 +656,12 @@ class WorkerFuncWrapper:
 
     def __call__(self, args):
         segment_index, start_frame, end_frame = args
-        if self.max_threads_per_worker is None:
-            return self.func(segment_index, start_frame, end_frame, self.worker_dict)
-        else:
-            with threadpool_limits(limits=self.max_threads_per_worker):
+        with thread_budget(self.max_threads_per_worker):
+            if self.max_threads_per_worker is None:
                 return self.func(segment_index, start_frame, end_frame, self.worker_dict)
+            else:
+                with threadpool_limits(limits=self.max_threads_per_worker):
+                    return self.func(segment_index, start_frame, end_frame, self.worker_dict)
 
 
 # see
@@ -730,6 +735,66 @@ def thread_function_wrapper(args):
     thread_local_data = args[0]
     args = args[1:]
     return thread_local_data.func_wrapper(args)
+
+
+# Threads a single get_traces call may use inside each preprocessing step. It lives in the execution context rather
+# than in arguments, so a step that does not use it cannot drop it for the steps it calls.
+_thread_budget = ContextVar("thread_budget", default=1)
+
+
+@contextmanager
+def thread_budget(max_threads):
+    """Let each step of a get_traces call made in this context use up to `max_threads` threads (None means 1)."""
+    token = _thread_budget.set(max(1, int(max_threads or 1)))
+    try:
+        yield
+    finally:
+        _thread_budget.reset(token)
+
+
+def get_thread_budget():
+    """The number of threads a step may use for the current get_traces call."""
+    return _thread_budget.get()
+
+
+# Pools are per calling thread, so concurrent executor workers never queue on one shared pool. A finalizer shuts a
+# thread's pools down when it exits, and the pid guard drops pools inherited through fork, whose threads are gone.
+_inner_pools = weakref.WeakKeyDictionary()
+_inner_pools_lock = threading.Lock()
+_inner_pools_pid = os.getpid()
+
+
+def _shutdown_pools(pools):
+    for pool in pools.values():
+        pool.shutdown(wait=False)
+
+
+def get_inner_pool():
+    """
+    A thread pool sized to the current thread budget, or None when the budget is 1.
+
+    Tasks on the pool run with a budget of 1, so steps they call do not start pools of their own.
+    """
+    global _inner_pools_pid
+    max_threads = _thread_budget.get()
+    if max_threads <= 1:
+        return None
+    with _inner_pools_lock:
+        if _inner_pools_pid != os.getpid():
+            _inner_pools.clear()
+            _inner_pools_pid = os.getpid()
+        thread = threading.current_thread()
+        pools = _inner_pools.get(thread)
+        if pools is None:
+            pools = _inner_pools[thread] = {}
+            weakref.finalize(thread, _shutdown_pools, pools)
+        pool = pools.get(max_threads)
+        if pool is None:
+            # A worker thread may inherit its creator's context, so set the budget explicitly
+            pool = pools[max_threads] = ThreadPoolExecutor(
+                max_workers=max_threads, initializer=_thread_budget.set, initargs=(1,)
+            )
+    return pool
 
 
 # Here some utils copy/paste from DART (Charlie Windolf)
