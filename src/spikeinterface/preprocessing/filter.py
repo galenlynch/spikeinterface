@@ -8,6 +8,7 @@ from spikeinterface.core import (
     ensure_chunk_size,
     get_global_job_kwargs,
     is_set_global_job_kwargs_set,
+    get_inner_pool,
 )
 
 from .basepreprocessor import BasePreprocessor, BasePreprocessorSegment
@@ -220,34 +221,53 @@ class FilterRecordingSegment(BasePreprocessorSegment):
 
         from scipy.signal import sosfiltfilt, filtfilt, sosfilt, lfilter
 
-        if self.direction == "forward-backward":
-            if self.filter_mode == "sos":
-                filtered_traces = sosfiltfilt(self.coeff, traces_chunk, axis=0)
-            elif self.filter_mode == "ba":
-                b, a = self.coeff
-                filtered_traces = filtfilt(b, a, traces_chunk, axis=0)
+        # Channels are filtered independently, so filtering in banks gives the same result with a
+        # much lower peak memory (scipy makes several float copies of its input); banks also run in
+        # parallel when the thread budget allows, since scipy's filters release the GIL
+        num_samples = traces_chunk.shape[0] - left_margin - right_margin
+        num_channels = traces_chunk.shape[1]
+        num_channels_per_bank = 16
+        filtered_traces = np.empty((num_samples, num_channels), dtype=self.dtype)
+
+        def filter_bank(channel_index):
+            channel_slice = slice(channel_index, channel_index + num_channels_per_bank)
+            block = traces_chunk[:, channel_slice]
+
+            if self.direction == "forward-backward":
+                if self.filter_mode == "sos":
+                    filtered_block = sosfiltfilt(self.coeff, block, axis=0)
+                elif self.filter_mode == "ba":
+                    b, a = self.coeff
+                    filtered_block = filtfilt(b, a, block, axis=0)
+            else:
+                if self.direction == "backward":
+                    block = np.flip(block, axis=0)
+
+                if self.filter_mode == "sos":
+                    filtered_block = sosfilt(self.coeff, block, axis=0)
+                elif self.filter_mode == "ba":
+                    b, a = self.coeff
+                    filtered_block = lfilter(b, a, block, axis=0)
+
+                if self.direction == "backward":
+                    filtered_block = np.flip(filtered_block, axis=0)
+
+            filtered_block = filtered_block[left_margin : filtered_block.shape[0] - right_margin, :]
+
+            if np.issubdtype(self.dtype, np.integer):
+                filtered_block = filtered_block.round()
+
+            filtered_traces[:, channel_slice] = filtered_block
+
+        bank_starts = range(0, num_channels, num_channels_per_bank)
+        pool = get_inner_pool()
+        if pool is None or len(bank_starts) < 2:
+            for channel_index in bank_starts:
+                filter_bank(channel_index)
         else:
-            if self.direction == "backward":
-                traces_chunk = np.flip(traces_chunk, axis=0)
+            list(pool.map(filter_bank, bank_starts))
 
-            if self.filter_mode == "sos":
-                filtered_traces = sosfilt(self.coeff, traces_chunk, axis=0)
-            elif self.filter_mode == "ba":
-                b, a = self.coeff
-                filtered_traces = lfilter(b, a, traces_chunk, axis=0)
-
-            if self.direction == "backward":
-                filtered_traces = np.flip(filtered_traces, axis=0)
-
-        if right_margin > 0:
-            filtered_traces = filtered_traces[left_margin:-right_margin, :]
-        else:
-            filtered_traces = filtered_traces[left_margin:, :]
-
-        if np.issubdtype(self.dtype, np.integer):
-            filtered_traces = filtered_traces.round()
-
-        return filtered_traces.astype(self.dtype)
+        return filtered_traces
 
 
 class BandpassFilterRecording(FilterRecording):
