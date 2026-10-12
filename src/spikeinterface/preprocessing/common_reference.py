@@ -10,6 +10,8 @@ from spikeinterface.core.baserecording import BaseRecording
 
 from .filter import fix_dtype
 from ._row_median import row_median
+from .fir_filter import _L2_BYTES
+from spikeinterface.core.job_tools import get_inner_pool
 
 
 class CommonReferenceRecording(BasePreprocessor):
@@ -254,6 +256,9 @@ class CommonReferenceRecordingSegment(BasePreprocessorSegment):
             traces = self.parent_recording_segment.get_traces(start_frame, end_frame, slice(None))
 
             if self.reference == "global":
+                pool = get_inner_pool()
+                if pool is not None:
+                    return self._global_reference_threaded(traces, channel_indices, pool)
                 if self.ref_channel_indices is None:
                     shift = self.operator_func(traces, axis=1, keepdims=True)
                 else:
@@ -312,6 +317,24 @@ class CommonReferenceRecordingSegment(BasePreprocessorSegment):
                     re_referenced_traces[:, out_indices] = in_group_traces - shift
 
             return re_referenced_traces.astype(self.dtype, copy=False)
+
+    def _global_reference_threaded(self, traces, channel_indices, pool):
+        """The global reference in blocks of rows small enough for L2, one block per pool task, as one pass."""
+        ref_channels = slice(None) if self.ref_channel_indices is None else self.ref_channel_indices
+        num_samples = traces.shape[0]
+        out_channels = np.arange(traces.shape[1])[channel_indices]
+        out = np.empty((num_samples, out_channels.size), dtype=self.dtype)
+        rows = max(256, _L2_BYTES // (2 * traces.dtype.itemsize * traces.shape[1]))
+
+        def reference_rows(r0):
+            block = traces[r0 : r0 + rows]
+            referenced = block[:, channel_indices] - self.operator_func(block[:, ref_channels], axis=1, keepdims=True)
+            if np.issubdtype(self.dtype, np.integer):
+                np.round(referenced, out=referenced)
+            out[r0 : r0 + rows] = referenced
+
+        list(pool.map(reference_rows, range(0, num_samples, rows)))
+        return out
 
     def slice_groups(self, channel_indices):
         """
