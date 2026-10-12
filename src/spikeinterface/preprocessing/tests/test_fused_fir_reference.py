@@ -27,7 +27,7 @@ def recording():
 
 def unfused_chain(rec, with_phase_shift, operator, filter_step="bandpass"):
     if with_phase_shift:
-        rec = phase_shift(rec, method="fir", output_dtype="float32")
+        rec = phase_shift(rec, method="fir", dtype="float32")
     if filter_step == "bandpass":
         rec = bandpass_filter(rec, method="fir", dtype="float32")
     elif filter_step == "highpass":
@@ -67,7 +67,7 @@ def test_fused_matches_per_group_kernels(recording):
     num_taps = max(highpass_300.size, highpass_600.size)
     taps = np.stack([np.pad(k, (num_taps - k.size) // 2) for k in (highpass_300, highpass_600)])
     groups = np.arange(recording.get_num_channels()) % 2
-    rec = phase_shift(recording, method="fir", output_dtype="float32")
+    rec = phase_shift(recording, method="fir", dtype="float32")
     chain = common_reference(fir_filter(rec, taps, channel_groups=groups, dtype="float32"), dtype="float32")
     assert_matches_away_from_edges(fuse(chain).get_traces(), chain.get_traces())
 

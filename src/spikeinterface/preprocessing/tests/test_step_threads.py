@@ -18,7 +18,7 @@ def recording():
 
 
 STEPS = {
-    "phase_shift int16": lambda r: phase_shift(r, method="fir", output_dtype="float32"),
+    "phase_shift int16": lambda r: phase_shift(r, method="fir", dtype="float32"),
     "phase_shift float32": lambda r: phase_shift(bandpass_filter(r, method="fir", dtype="float32"), method="fir"),
     "fir bandpass": lambda r: bandpass_filter(r, method="fir", dtype="float32"),
     "fir bandpass int16": lambda r: bandpass_filter(r, method="fir"),

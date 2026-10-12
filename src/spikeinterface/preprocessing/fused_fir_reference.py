@@ -30,7 +30,7 @@ from .basepreprocessor import BasePreprocessor, BasePreprocessorSegment
 from ._row_median import row_median
 from .common_reference import CommonReferenceRecording
 from .fir_filter import _L2_BYTES, FIRFilterRecordingSegment, _channels_per_block, _overlap_save_fft_length
-from .phase_shift import PhaseShiftRecording, _build_fir_kernels_kc
+from .phase_shift import PhaseShiftRecording, _build_fir_taps
 
 
 def _mean_reference(block):
@@ -50,15 +50,13 @@ def build_composite_kernels(taps, channel_groups, center, sample_shifts=None, n_
     if sample_shifts is None:
         return np.ascontiguousarray(taps.T), channel_groups, center
 
-    # The phase shift correlates, y[n] = sum_k h[k] x[n - half + k]; reversed it is a convolution centred on
-    # n_taps - 1 - half, and two convolutions compose with their centres added.
-    half = n_taps // 2
-    shift_kernels_kc = _build_fir_kernels_kc(sample_shifts, n_taps).astype(np.float64)[::-1]
-    num_channels = shift_kernels_kc.shape[1]
+    # Both kernels are in fir_filter's tap order, so they compose by convolution with their centres added.
+    shift_taps = _build_fir_taps(sample_shifts, n_taps)
+    num_channels = shift_taps.shape[0]
     kernels_lc = np.empty((taps.shape[1] + n_taps - 1, num_channels))
     for c in range(num_channels):
-        kernels_lc[:, c] = np.convolve(taps[channel_groups[c]], shift_kernels_kc[:, c])
-    return kernels_lc, np.arange(num_channels), center + n_taps - 1 - half
+        kernels_lc[:, c] = np.convolve(taps[channel_groups[c]], shift_taps[c])
+    return kernels_lc, np.arange(num_channels), center + (n_taps - 1) // 2
 
 
 class FusedFIRReferenceRecording(BasePreprocessor):

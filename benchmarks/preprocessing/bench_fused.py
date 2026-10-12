@@ -47,7 +47,7 @@ def build(variant, raw):
         rec = spre.phase_shift(rec)
         rec = spre.bandpass_filter(rec)
         return spre.common_reference(rec, operator="median")
-    rec = spre.phase_shift(rec, method="fir", output_dtype="float32")
+    rec = spre.phase_shift(rec, method="fir", dtype="float32")
     rec = spre.bandpass_filter(rec, method="fir", dtype="float32")
     rec = spre.common_reference(rec, operator="median", dtype="float32")
     return fuse(rec) if variant == "fused" else rec
