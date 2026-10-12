@@ -51,7 +51,8 @@ def build_composite_kernels(taps, channel_groups, center, sample_shifts=None, n_
         return np.ascontiguousarray(taps.T), channel_groups, center
 
     # Both kernels are in fir_filter's tap order, so they compose by convolution with their centres added.
-    shift_taps = _build_fir_taps(sample_shifts, n_taps)
+    # Rounded as phase_shift rounds them, so the fused step applies the same kernels as the separate steps.
+    shift_taps = _build_fir_taps(sample_shifts, n_taps).astype(np.float32)
     num_channels = shift_taps.shape[0]
     kernels_lc = np.empty((taps.shape[1] + n_taps - 1, num_channels))
     for c in range(num_channels):
