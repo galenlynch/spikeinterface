@@ -6,6 +6,7 @@ import threading
 import numpy as np
 
 from spikeinterface.core.core_tools import define_function_handling_dict_from_class
+from spikeinterface.core.job_tools import _get_inner_pool, _get_thread_budget
 
 from .basepreprocessor import BasePreprocessor, BasePreprocessorSegment
 from .filter import fix_dtype
@@ -187,16 +188,19 @@ class FIRFilterRecordingSegment(BasePreprocessorSegment):
         step = fft_length - num_taps + 1
         spectra = self._get_kernel_spectra(fft_length)
         one_kernel = spectra.shape[1] == 1
+        pool = _get_inner_pool()
         # The float32 block and its complex64 spectrum take 8 bytes per sample, and per-channel kernel spectra 4 more.
-        slab = _channels_per_block(num_channels, fft_length, bytes_per_sample=8 if one_kernel else 12)
+        slab = _channels_per_block(
+            num_channels, fft_length, bytes_per_sample=8 if one_kernel else 12, pool_size=_get_thread_budget()
+        )
 
         # Each block is rounded and cast as it is written, so no full float32 copy of the chunk is held.
         out = np.empty((num_samples, num_channels), dtype=self.dtype)
         round_to_integer = np.issubdtype(self.dtype, np.integer)
-        buffer = np.empty((fft_length, slab), dtype=np.float32)
-        for c0 in range(0, num_channels, slab):
+
+        def filter_slab(c0):
             c1 = min(num_channels, c0 + slab)
-            tile = buffer[:, : c1 - c0]
+            tile = np.empty((fft_length, c1 - c0), dtype=np.float32)
             tile_spectra = spectra if one_kernel else spectra[:, groups[c0:c1]]
             for t0 in range(0, num_samples, step):
                 num_out = min(step, num_samples - t0)
@@ -211,6 +215,13 @@ class FIRFilterRecordingSegment(BasePreprocessorSegment):
                 if round_to_integer:
                     np.rint(valid, out=valid)
                 out[t0 : t0 + num_out, c0:c1] = valid
+
+        slab_starts = range(0, num_channels, slab)
+        if pool is None:
+            for c0 in slab_starts:
+                filter_slab(c0)
+        else:
+            list(pool.map(filter_slab, slab_starts))
 
         return out
 

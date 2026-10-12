@@ -3,8 +3,10 @@ import numpy as np
 from spikeinterface.core.core_tools import define_function_handling_dict_from_class
 
 from spikeinterface.core import get_chunk_with_margin, apply_raised_cosine_taper
+from spikeinterface.core.job_tools import _get_inner_pool
 
 from .basepreprocessor import BasePreprocessor, BasePreprocessorSegment
+from .fir_filter import _L2_BYTES
 
 # 16 taps keep the response flat across the Neuropixels passband; fewer start to cut into it.
 _DEFAULT_FIR_TAPS = 16
@@ -188,15 +190,30 @@ class PhaseShiftRecordingSegment(BasePreprocessorSegment):
             kernels_kc = np.ascontiguousarray(self._fir_kernels_kc[:, channel_indices])
 
         if not _HAS_NUMBA:
-            shifted = _sinc_fir_numpy_tc(traces, kernels_kc)
+            kernel = _sinc_fir_numpy_tc
         elif traces.dtype == np.int16:
             traces = np.ascontiguousarray(traces)
-            shifted = _sinc_fir_kernel_int16_tc(traces, kernels_kc)
+            kernel = _sinc_fir_kernel_int16_tc
         else:
-            sig_f32 = np.ascontiguousarray(traces, dtype=np.float32)
-            shifted = _sinc_fir_kernel_tc(sig_f32, kernels_kc)
+            traces = np.ascontiguousarray(traces, dtype=np.float32)
+            kernel = _sinc_fir_kernel_tc
 
-        out = shifted[half : half + (end_frame - start_frame), :]
+        num_out = end_frame - start_frame
+        pool = _get_inner_pool()
+        if pool is None:
+            out = kernel(traces, kernels_kc)[half : half + num_out, :]
+        else:
+            # Each block reads its rows plus the kernel's halo, so every row it keeps is an interior row of the
+            # kernel's loop and the output equals the single-threaded one.
+            tail = self.n_taps - 1 - half
+            rows = max(256, _L2_BYTES // (2 * 4 * traces.shape[1]))
+            out = np.empty((num_out, traces.shape[1]), dtype=np.float32)
+
+            def shift_rows(r0):
+                r1 = min(r0 + rows, num_out)
+                out[r0:r1] = kernel(traces[r0 : r1 + half + tail], kernels_kc)[half : half + r1 - r0]
+
+            list(pool.map(shift_rows, range(0, num_out, rows)))
 
         if out.dtype == self.dtype:
             return out
