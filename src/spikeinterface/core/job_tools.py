@@ -755,7 +755,7 @@ def thread_budget(max_threads):
         _thread_budget.reset(token)
 
 
-def get_thread_budget():
+def _get_thread_budget():
     """The number of threads a step may use for the current get_traces call."""
     return _thread_budget.get()
 
@@ -772,7 +772,7 @@ def _shutdown_pools(pools):
         pool.shutdown(wait=False)
 
 
-def get_inner_pool():
+def _get_inner_pool():
     """
     A thread pool sized to the current thread budget, or None when the budget is 1.
 

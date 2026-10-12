@@ -16,8 +16,8 @@ from spikeinterface.core.job_tools import (
     ensure_chunk_size,
     ensure_n_jobs,
     fix_job_kwargs,
-    get_inner_pool,
-    get_thread_budget,
+    _get_inner_pool,
+    _get_thread_budget,
     get_usable_cpu_count,
     split_job_kwargs,
     thread_budget,
@@ -370,7 +370,7 @@ if __name__ == "__main__":
 
 
 def _record_thread_budget(segment_index, start_frame, end_frame, worker_ctx):
-    return get_thread_budget()
+    return _get_thread_budget()
 
 
 def _empty_worker_dict():
@@ -392,14 +392,14 @@ def test_executor_sets_thread_budget(n_jobs, pool_engine):
         max_threads_per_worker=3,
     )
     assert set(executor.run()) == {3}
-    assert get_thread_budget() == 1
+    assert _get_thread_budget() == 1
 
 
 def test_inner_pool_tasks_get_budget_of_one():
-    assert get_inner_pool() is None
+    assert _get_inner_pool() is None
     with thread_budget(4):
-        assert get_thread_budget() == 4
-        pool = get_inner_pool()
-        assert pool is get_inner_pool()
-        assert set(pool.map(lambda _: get_thread_budget(), range(16))) == {1}
-    assert get_thread_budget() == 1
+        assert _get_thread_budget() == 4
+        pool = _get_inner_pool()
+        assert pool is _get_inner_pool()
+        assert set(pool.map(lambda _: _get_thread_budget(), range(16))) == {1}
+    assert _get_thread_budget() == 1

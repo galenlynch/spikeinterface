@@ -6,7 +6,7 @@ from spikeinterface.core.core_tools import define_function_handling_dict_from_cl
 
 from .basepreprocessor import BasePreprocessor, BasePreprocessorSegment
 from spikeinterface.core import get_closest_channels
-from spikeinterface.core.job_tools import get_inner_pool
+from spikeinterface.core.job_tools import _get_inner_pool
 from spikeinterface.core.baserecording import BaseRecording
 
 from .filter import fix_dtype
@@ -256,7 +256,7 @@ class CommonReferenceRecordingSegment(BasePreprocessorSegment):
             traces = self.parent_recording_segment.get_traces(start_frame, end_frame, slice(None))
 
             if self.reference == "global":
-                pool = get_inner_pool()
+                pool = _get_inner_pool()
                 if pool is not None:
                     return self._global_reference_threaded(traces, channel_indices, pool)
                 if self.ref_channel_indices is None:
