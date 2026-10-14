@@ -96,9 +96,11 @@ def test_fuse_leaves_unsupported_chains_unchanged(recording):
     assert fuse(reflect) is reflect
 
 
-def test_fused_int16_output_rounds_once(recording):
+def test_fused_int16_references_rounded_values(recording):
     chain = common_reference(bandpass_filter(phase_shift(recording, method="fir"), method="fir"))
     fused = fuse(chain)
     assert fused.get_dtype() == np.int16
-    float_chain = fuse(unfused_chain(recording, True, "median"))
-    np.testing.assert_array_equal(fused.get_traces(), np.rint(float_chain.get_traces()).astype(np.int16))
+    # The filtered values are rounded before the median, as the unfused int16 chain rounds them.
+    filtered = np.rint(fuse(unfused_chain(recording, True, None)).get_traces())
+    expected = np.rint(filtered - np.median(filtered.astype(np.int16), axis=1, keepdims=True)).astype(np.int16)
+    np.testing.assert_array_equal(fused.get_traces(), expected)

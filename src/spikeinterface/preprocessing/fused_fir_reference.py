@@ -11,8 +11,9 @@ where the filter is ``fir_filter`` or ``highpass_filter``/``bandpass_filter`` wi
 - When every channel slab of a time block is done, the block's rows are split into L2-sized pieces for the common
   reference, and threads take those ahead of new tiles while the block is in cache.
 
-Intermediates stay float32 and the output is cast to the leaf's dtype once, so the result differs from an unfused
-integer chain by the roundings that chain does after each step. At the recording's edges the unfused chain
+Filtering is in float32. For an integer output dtype the filtered values are rounded to it before the common
+reference, as the unfused chain rounds them, so the median runs on integers; the result differs from the unfused
+chain only by the rounding that chain does after its phase shift. At the recording's edges the unfused chain
 zero-pads before each step and the fused one only before the first, so the outputs also differ within a kernel
 length of the edges.
 """
@@ -198,7 +199,10 @@ class FusedFIRReferenceRecordingSegment(BasePreprocessorSegment):
         # The float32 block and its complex64 spectrum take 8 bytes per sample, and per-channel kernel spectra 4 more.
         slab_channels = _channels_per_block(num_channels, fft_length, bytes_per_sample=8 if one_kernel else 12)
         slabs = [(c0, min(c0 + slab_channels, num_channels)) for c0 in range(0, num_channels, slab_channels)]
-        out = np.empty((num_out, num_channels), dtype=np.float32)
+        integer_out = np.issubdtype(self.dtype, np.integer)
+        if integer_out:
+            info = np.iinfo(self.dtype)
+        out = np.empty((num_out, num_channels), dtype=self.dtype if integer_out else np.float32)
         # Reference rows are split into pieces that fit in L2, so a finished block is shared across threads.
         reference_rows = max(64, int(0.5 * _L2_BYTES / (4 * num_channels)))
 
@@ -213,10 +217,19 @@ class FusedFIRReferenceRecordingSegment(BasePreprocessorSegment):
             spectrum = scipy.fft.rfft(tile, axis=0, overwrite_x=True)
             spectrum *= spectra if one_kernel else spectra[:, kernel_index[c0:c1]]
             result = scipy.fft.irfft(spectrum, n=fft_length, axis=0, overwrite_x=True)
-            out[t0:t1, c0:c1] = result[overlap : overlap + (t1 - t0)]
+            valid = result[overlap : overlap + (t1 - t0)]
+            if integer_out:
+                valid = np.clip(np.rint(valid, out=valid), info.min, info.max, out=valid)
+            out[t0:t1, c0:c1] = valid
 
         def run_reference(r0, r1):
-            out[r0:r1] -= self.reference_func(out[r0:r1])
+            rows = out[r0:r1]
+            if integer_out:
+                # Integer rows take row_median's histogram kernel; the difference is rounded as common_reference does.
+                referenced = rows - self.reference_func(rows)
+                out[r0:r1] = np.clip(np.rint(referenced, out=referenced), info.min, info.max, out=referenced)
+            else:
+                rows -= self.reference_func(rows)
 
         tiles = [(b, c0, c1) for b in range(num_blocks) for c0, c1 in slabs]
         slabs_left = [len(slabs)] * num_blocks
@@ -268,9 +281,6 @@ class FusedFIRReferenceRecordingSegment(BasePreprocessorSegment):
 
         if self.reference_func is not None:
             out = out[:, channel_indices]
-        if np.issubdtype(self.dtype, np.integer):
-            info = np.iinfo(self.dtype)
-            out = np.clip(np.rint(out), info.min, info.max)
         return out.astype(self.dtype, copy=False)
 
 
