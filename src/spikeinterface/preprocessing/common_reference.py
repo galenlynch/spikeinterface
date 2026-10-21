@@ -6,10 +6,13 @@ from spikeinterface.core.core_tools import define_function_handling_dict_from_cl
 
 from .basepreprocessor import BasePreprocessor, BasePreprocessorSegment
 from spikeinterface.core import get_closest_channels
+from spikeinterface.core.job_tools import _get_inner_pool
 from spikeinterface.core.baserecording import BaseRecording
 
 from .filter import fix_dtype
 from ._row_median import row_median
+
+_REFERENCE_BLOCK_BYTES = 512 * 1024
 
 
 class CommonReferenceRecording(BasePreprocessor):
@@ -254,6 +257,9 @@ class CommonReferenceRecordingSegment(BasePreprocessorSegment):
             traces = self.parent_recording_segment.get_traces(start_frame, end_frame, slice(None))
 
             if self.reference == "global":
+                pool = _get_inner_pool()
+                if pool is not None:
+                    return self._global_reference_threaded(traces, channel_indices, pool)
                 if self.ref_channel_indices is None:
                     shift = self.operator_func(traces, axis=1, keepdims=True)
                 else:
@@ -312,6 +318,24 @@ class CommonReferenceRecordingSegment(BasePreprocessorSegment):
                     re_referenced_traces[:, out_indices] = in_group_traces - shift
 
             return re_referenced_traces.astype(self.dtype, copy=False)
+
+    def _global_reference_threaded(self, traces, channel_indices, pool):
+        """The global reference in blocks of rows, one block per pool task, each referenced and written in one pass."""
+        ref_channels = slice(None) if self.ref_channel_indices is None else self.ref_channel_indices
+        num_samples = traces.shape[0]
+        out = np.empty((num_samples, np.arange(traces.shape[1])[channel_indices].size), dtype=self.dtype)
+        # Small blocks keep each task's rows in L2 and the pool's threads on nearby rows, which share L3.
+        rows = max(256, _REFERENCE_BLOCK_BYTES // (traces.dtype.itemsize * traces.shape[1]))
+
+        def reference_rows(r0):
+            block = traces[r0 : r0 + rows]
+            referenced = block[:, channel_indices] - self.operator_func(block[:, ref_channels], axis=1, keepdims=True)
+            if np.issubdtype(self.dtype, np.integer):
+                np.round(referenced, out=referenced)
+            out[r0 : r0 + rows] = referenced
+
+        list(pool.map(reference_rows, range(0, num_samples, rows)))
+        return out
 
     def slice_groups(self, channel_indices):
         """

@@ -1,7 +1,7 @@
 import operator
 import pytest
 
-from spikeinterface.core import generate_recording, NumpyRecording
+from spikeinterface.core import generate_recording, NumpyRecording, thread_budget
 
 from spikeinterface.preprocessing import common_reference
 
@@ -327,3 +327,28 @@ def test_local_car_vs_cmr_performance():
 
 if __name__ == "__main__":
     test_local_car_vs_cmr_performance()
+
+
+@pytest.mark.parametrize("operator", ["median", "average"])
+@pytest.mark.parametrize("dtype", ["int16", "float32"])
+@pytest.mark.parametrize("use_ref_channels", [False, True])
+def test_global_reference_threaded_equals_one_thread(operator, dtype, use_ref_channels):
+    rng = np.random.default_rng(0)
+    traces = (rng.standard_normal((20_000, 64)) * 50).astype(dtype)
+    recording = NumpyRecording(np.asfortranarray(traces), 30_000.0)
+    ref_channel_ids = list(recording.channel_ids[::3]) if use_ref_channels else None
+    referenced = common_reference(recording, operator=operator, ref_channel_ids=ref_channel_ids)
+    for kwargs in (dict(), dict(start_frame=123, end_frame=17_000, channel_ids=recording.channel_ids[5:30])):
+        expected = referenced.get_traces(**kwargs)
+        with thread_budget(4):
+            threaded = referenced.get_traces(**kwargs)
+        assert threaded.dtype == expected.dtype
+        np.testing.assert_array_equal(threaded, expected)
+
+
+def test_global_reference_threads_from_max_threads_per_worker(tmp_path):
+    rng = np.random.default_rng(0)
+    recording = NumpyRecording((rng.standard_normal((60_000, 32)) * 50).astype("int16"), 30_000.0)
+    referenced = common_reference(recording)
+    saved = referenced.save(folder=tmp_path / "saved", n_jobs=1, max_threads_per_worker=4, chunk_duration="1s")
+    np.testing.assert_array_equal(saved.get_traces(), referenced.get_traces())
