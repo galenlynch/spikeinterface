@@ -25,7 +25,7 @@ from collections import deque
 
 import numpy as np
 
-from spikeinterface.core.job_tools import get_inner_pool, get_thread_budget
+from spikeinterface.core.job_tools import _get_inner_pool, _get_thread_budget
 
 from .basepreprocessor import BasePreprocessor, BasePreprocessorSegment
 from ._row_median import row_median
@@ -272,11 +272,11 @@ class FusedFIRReferenceRecordingSegment(BasePreprocessorSegment):
                         )
                     state.notify_all()
 
-        pool = get_inner_pool()
+        pool = _get_inner_pool()
         if pool is None or len(tiles) < 2:
             work()
         else:
-            for future in [pool.submit(work) for _ in range(get_thread_budget())]:
+            for future in [pool.submit(work) for _ in range(_get_thread_budget())]:
                 future.result()
 
         if self.reference_func is not None:
